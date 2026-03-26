@@ -6,7 +6,7 @@ class UnlabeledDataset(Dataset):
     def __init__(self, file, model_name="xlm-roberta-base"):
         self.df = pd.read_csv(file)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.texts = self.df["review"].tolist()
+        self.texts = self.df["sentence"].tolist()
 
     def __len__(self):
         return len(self.texts)
