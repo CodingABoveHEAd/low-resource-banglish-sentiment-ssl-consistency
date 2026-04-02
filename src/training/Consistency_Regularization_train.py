@@ -3,6 +3,7 @@ from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from tqdm import tqdm
 from itertools import cycle
+import torch.nn.functional as F
 
 from src.data.dataset import BanglishDataset
 from src.data.unlabeled_dataset import UnlabeledDataset
@@ -12,7 +13,7 @@ from src.utils.metrics import compute_metrics
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def train():
+def train(num_epochs=5, lambda_u=0.5, tau=0.8, T=0.5):
 
     train_ds = BanglishDataset("data/processed/train.csv")
     val_ds = BanglishDataset("data/processed/val.csv")
@@ -23,25 +24,23 @@ def train():
     unlabeled_loader = DataLoader(unlabeled_ds, batch_size=16, shuffle=True)
 
     model = SentimentModel().to(device)
-
     optimizer = AdamW(model.parameters(), lr=2e-5)
     loss_fn = torch.nn.CrossEntropyLoss()
 
-    lambda_u = 0.5  # consistency weight
-
     best_f1 = 0.0
 
-    for epoch in range(3):
+    for epoch in range(num_epochs):
         model.train()
         total_loss = 0
 
         loop = tqdm(zip(train_loader, cycle(unlabeled_loader)), total=len(train_loader))
 
         for l_batch, u_batch in loop:
-
             optimizer.zero_grad()
 
-            # Supervised loss
+            # -----------------------------
+            # 🔹 Supervised loss
+            # -----------------------------
             input_ids = l_batch["input_ids"].to(device)
             attention_mask = l_batch["attention_mask"].to(device)
             labels = l_batch["labels"].to(device)
@@ -49,41 +48,58 @@ def train():
             outputs = model(input_ids, attention_mask)
             sup_loss = loss_fn(outputs, labels)
 
-            # Consistency loss
+            # -----------------------------
+            # 🔹 Unlabeled consistency
+            # -----------------------------
             u_input_ids = u_batch["input_ids"].to(device)
             u_attention_mask = u_batch["attention_mask"].to(device)
 
-            outputs1 = model(u_input_ids, u_attention_mask)
-            outputs2 = model(u_input_ids, u_attention_mask)
+            # stochastic forward passes
+            logits_w = model(u_input_ids, u_attention_mask)  # weak
+            logits_s = model(u_input_ids, u_attention_mask)  # strong
 
-            # detach one branch (stabilizes training)
-            p1 = torch.softmax(outputs1.detach(), dim=1)
-            p2 = torch.softmax(outputs2, dim=1)
+            probs_w = torch.softmax(logits_w.detach(), dim=1)
 
-            consistency_loss = torch.mean((p1 - p2) ** 2)
+            # confidence mask
+            max_probs, _ = torch.max(probs_w, dim=1)
+            mask = (max_probs >= tau).float()
 
-            # Total loss
+            # sharpening
+            probs_w = probs_w ** (1 / T)
+            probs_w = probs_w / probs_w.sum(dim=1, keepdim=True)
+
+            log_probs_s = F.log_softmax(logits_s, dim=1)
+
+            consistency_loss = F.kl_div(
+                log_probs_s, probs_w, reduction='none'
+            ).sum(dim=1)
+
+            # apply mask
+            consistency_loss = (consistency_loss * mask).mean()
+
+            # -----------------------------
+            # 🔹 Total loss
+            # -----------------------------
             loss = sup_loss + lambda_u * consistency_loss
 
             loss.backward()
             optimizer.step()
-
             total_loss += loss.item()
 
             loop.set_description(f"Epoch [{epoch+1}]")
             loop.set_postfix(loss=loss.item())
 
-        avg_loss = total_loss / len(train_loader)
-        print(f"\nEpoch {epoch+1} Avg Loss: {avg_loss:.4f}")
+        print(f"\nEpoch {epoch+1} Avg Loss: {total_loss:.4f}")
 
         acc, f1 = evaluate(model, val_loader)
 
+        # save best
         if f1 > best_f1:
             best_f1 = f1
-            torch.save(model.state_dict(), "consistency_regularization_pi_model_best_model.pt")
-            print(f"Best model saved! (F1: {best_f1:.4f})")
+            torch.save(model.state_dict(), "checkpoints/consistency_regularization_pi_model_best_model.pt")
+            print(f"Best model saved! F1: {best_f1:.4f}")
 
-        model.train()
+    return
 
 
 def evaluate(model, loader):
@@ -104,5 +120,4 @@ def evaluate(model, loader):
 
     acc, f1 = compute_metrics(preds, labels)
     print(f"Validation Accuracy: {acc:.4f}, F1: {f1:.4f}")
-
     return acc, f1

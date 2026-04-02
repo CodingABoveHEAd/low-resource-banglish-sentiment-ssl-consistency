@@ -3,3 +3,4 @@ commands.txt
 __pycache__
 checkpoints/
 *.pt
+.vscode/
